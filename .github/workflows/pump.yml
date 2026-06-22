@@ -1,0 +1,36 @@
+name: Pump Ignition Alert
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pump-ignition
+  cancel-in-progress: false
+
+jobs:
+  pump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install deps
+        run: pip install ccxt requests numpy
+      - name: restore state
+        uses: actions/cache@v4
+        with:
+          path: pump_state.json
+          key: pump-state-${{ github.run_id }}
+          restore-keys: pump-state-
+      - name: run pump scan
+        env:
+          DISCORD_WEBHOOK_PUMP: ${{ secrets.DISCORD_WEBHOOK_PUMP }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python pump_scan.py
