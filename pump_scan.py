@@ -9,6 +9,16 @@
 #   ・毎回、72h以上経過したアラートの +1h/4h/24h/72h リターンと
 #     MFE/MAE を outcomes_log.csv に追記 → ラベル付きデータが貯まる
 #   ※ pump.yml は *.csv / pending.json も commit する事(git add -A 推奨)
+# V2.1 additions (ADDITIVE ONLY - score/gate unchanged, collect-first):
+#   * takerbuy: taker-buy ratio from RAW 12-field klines (idx9/idx5,
+#     last 5 days; >0.5 = net aggressive buying). ONE raw kline fetch
+#     per symbol now feeds BOTH the OHLCV features and takerbuy.
+#   * obimb: order-book bid-depth share (top ~20 levels; >0.5 = more
+#     bids), fetched ONLY for finalist hot candidates for speed.
+#   Both are LOGGED (alerts/outcomes CSV) and shown in the alert line
+#   for later validation; they do NOT gate anything yet.
+#   Old CSVs (old header) are migrated in place: new columns appended,
+#   old rows padded with blanks - no data loss.
 # ================================================================
 import os, time, json, csv, datetime as dt, numpy as np, requests, ccxt
 
@@ -31,7 +41,7 @@ STABLE = {'USDC','FDUSD','TUSD','BUSD','DAI','EUR','USDP','AEUR','EURI','XUSD','
 EX = ccxt.binance({'enableRateLimit':True,'options':{'defaultType':'spot','fetchMarkets':['spot']}})
 EX.urls['api']['public'] = 'https://data-api.binance.vision/api/v3'
 
-ALERT_FIELDS = ["iso","epoch","sym","symbol","tier","score","vr","volz","creep","buyimb","ret5","nh","qv","price"]
+ALERT_FIELDS = ["iso","epoch","sym","symbol","tier","score","vr","volz","creep","buyimb","ret5","nh","qv","price","takerbuy","obimb"]
 OUT_FIELDS   = ALERT_FIELDS + ["ret1h","ret4h","ret24h","ret72h","mfe72","mae72","win"]
 
 def discord(text):
@@ -45,8 +55,37 @@ def load_json(p,default):
     try: return json.load(open(p))
     except Exception: return default
 
+def migrate_csv(path, fields):
+    # V2.1: older CSVs were written with a shorter header (no takerbuy/obimb).
+    # If the existing header lacks any current field, rewrite the file once:
+    # same rows, new header, blanks for the added columns. Write to a temp
+    # file and os.replace() so a crash can never corrupt the original.
+    if not os.path.exists(path): return
+    try:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), None)
+    except Exception:
+        return
+    if not header or header == list(fields): return
+    if all(c in header for c in fields): return   # already has every field
+    try:
+        with open(path, newline="") as f:
+            old_rows = list(csv.DictReader(f))
+        tmp = path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in old_rows:
+                w.writerow({k: (r.get(k) if r.get(k) is not None else "") for k in fields})
+        os.replace(tmp, path)
+        print("migrated %s: header %d -> %d cols (old rows padded with blanks)"
+              % (path, len(header), len(fields)))
+    except Exception as e:
+        print("csv migrate err", path, e)
+
 def append_csv(path, rows, fields):
     if not rows: return
+    migrate_csv(path, fields)      # V2.1: upgrade old header in place if needed
     exists = os.path.exists(path)
     with open(path,"a",newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -61,6 +100,46 @@ def fo(sym,tf,lim,minlen=60):
     except Exception: return None
     if not o or len(o)<minlen: return None
     a=np.array(o,float); return a[:,1],a[:,2],a[:,3],a[:,4],a[:,5]
+
+# ---- V2.1: raw 12-field klines --------------------------------------
+# ccxt fetch_ohlcv drops takerBuyBaseVolume, so hit /klines directly on
+# the same data-api.binance.vision base. Raw kline row layout:
+#   [0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 closeTime,
+#    7 quoteVolume, 8 trades, 9 takerBuyBaseVolume, 10 takerBuyQuoteVolume, 11 ignore]
+# ONE call per symbol returns BOTH the OHLCV arrays (same features as
+# before) and takerbuy = sum(takerBuyBase last 5)/sum(volume last 5)
+# (>0.5 = net aggressive buying). No extra API calls vs before.
+RAW_KLINES = "https://data-api.binance.vision/api/v3/klines"
+
+def fo_taker(sym,interval='1d',lim=120,minlen=60):
+    try:
+        resp=requests.get(RAW_KLINES,
+                          params={"symbol":sym.replace('/',''),   # 'ABC/USDT' -> 'ABCUSDT'
+                                  "interval":interval,"limit":lim},timeout=15)
+        k=resp.json()
+    except Exception:
+        return None
+    if not isinstance(k,list) or len(k)<minlen: return None
+    try:
+        a=np.array([[r[1],r[2],r[3],r[4],r[5],r[9]] for r in k],float)
+    except Exception:
+        return None
+    time.sleep(0.03)   # polite spacing (requests bypass ccxt's rate limiter)
+    O,H,L,C,V,TB=a[:,0],a[:,1],a[:,2],a[:,3],a[:,4],a[:,5]
+    takerbuy=float(np.sum(TB[-5:])/(np.sum(V[-5:])+EPS))
+    return O,H,L,C,V,takerbuy
+
+def ob_imbalance(symbol):
+    # V2.1: order-book depth imbalance, top ~20 levels of a 50-level book.
+    # >0.5 = more resting bid size than ask size. Called ONLY for finalist
+    # hot candidates (max TOPN fetches per run), never for all 300.
+    try:
+        ob=EX.fetch_order_book(symbol,limit=50)
+        b=sum(x[1] for x in (ob.get('bids') or [])[:20])
+        a=sum(x[1] for x in (ob.get('asks') or [])[:20])
+        return b/(b+a) if (b+a)>0 else None
+    except Exception:
+        return None
 
 def ig_raw(O,H,L,C,V):
     t=len(C)-1
@@ -79,7 +158,7 @@ def resolve_pending(pending):
     nowep=time.time(); resolved=[]
     for key,a in list(pending.items()):
         age=nowep-a["epoch"]
-        if age < RESOLVE_AFTER:
+        if age < RESOLVE_AFTER:        # まだ早い
             continue
         symbol=a.get("symbol"); p0=a.get("price")
         if not symbol or not p0:
@@ -115,6 +194,7 @@ def main():
     state   = load_json(STATE,{})
     pending = load_json(PENDING,{})
 
+    # 1) 過去アラートの結果確定(データ蓄積)
     resolve_pending(pending)
 
     EX.load_markets()
@@ -125,10 +205,16 @@ def main():
     cand=sorted(cand,key=lambda s:-(tk[s].get('quoteVolume') or 0))[:MAX_SCAN]
     data=[]
     for s in cand:
-        r=fo(s,'1d',120)
+        # V2.1: ONE raw-kline fetch gives OHLCV features AND takerbuy
+        rt=fo_taker(s,'1d',120)
+        if rt is not None:
+            r=rt[:5]; tb=rt[5]
+        else:
+            r=fo(s,'1d',120); tb=None    # fallback: ccxt path (no taker field)
         if not r: continue
         ig=ig_raw(*r)
         if ig:
+            ig['takerbuy']=tb            # logged only - not in score/gate
             ig['sym']=s.split('/')[0]; ig['symbol']=s
             ig['qv']=tk[s]['quoteVolume']
             ig['price']=float(tk[s].get('last') or r[3][-1])
@@ -143,16 +229,26 @@ def main():
     p95=np.percentile(sc,95); p98=np.percentile(sc,98)
     hot=[d for d in sorted(data,key=lambda d:-d['score'])
          if d['ret5']<FRESH and (d['vr']>1.3 or d['volz']>1.5) and d['score']>=p95][:TOPN]
+    # V2.1: order book only for the finalists that passed the score gate
+    for d in hot:
+        d['obimb']=ob_imbalance(d['symbol'])
     def tier_of(d): return "🔴最上位" if d['score']>=p98 else "🟠上位5%"
+    def bflow(d):   # V2.1: buy-demand tags (TB=taker-buy ratio, OB=bid share)
+        s=""
+        if d.get('takerbuy') is not None: s+=" TB%.2f"%d['takerbuy']
+        if d.get('obimb')    is not None: s+=" OB%.2f"%d['obimb']
+        return s
     def line(d):
-        return "%s `%-10s` 出来高x%.0f ・ Z%+.1f ・ 買偏%.1f ・ 5日%+.0f%% ・ $%.0fM"%(
-            tier_of(d),d['sym'],d['vr'],d['volz'],d['buyimb'],d['ret5']*100,d['qv']/1e6)
+        return "%s `%-10s` 出来高x%.0f ・ Z%+.1f ・ 買偏%.1f ・ 5日%+.0f%% ・ $%.0fM%s"%(
+            tier_of(d),d['sym'],d['vr'],d['volz'],d['buyimb'],d['ret5']*100,d['qv']/1e6,bflow(d))
 
-    def rec(d):
+    def rec(d):  # V2: アラートを記録(CSV + pending)
         row=dict(iso=now.isoformat(),epoch=round(ep,0),sym=d['sym'],symbol=d['symbol'],
                  tier=tier_of(d),score=round(d['score'],4),vr=round(d['vr'],3),volz=round(d['volz'],3),
                  creep=round(d['creep'],4),buyimb=round(d['buyimb'],3),ret5=round(d['ret5'],4),
-                 nh=round(d['nh'],3),qv=round(d['qv'],0),price=d['price'])
+                 nh=round(d['nh'],3),qv=round(d['qv'],0),price=d['price'],
+                 takerbuy=(round(d['takerbuy'],4) if d.get('takerbuy') is not None else ""),
+                 obimb=(round(d['obimb'],4) if d.get('obimb') is not None else ""))
         append_csv(ALERTS_CSV,[row],ALERT_FIELDS)
         pending["%s|%d"%(d['symbol'],int(ep))]=row
 
@@ -161,7 +257,7 @@ def main():
         k=d['sym']; prev=state.get(k)
         if prev and ep-prev<COOLDOWN: continue
         new.append(d); state[k]=ep
-        rec(d)
+        rec(d)                                  # V2: 実アラートを記録
 
     if EVENT=="workflow_dispatch":
         body="\n".join(line(d) for d in hot) if hot else "（現在、初動の点火候補なし＝静かな相場。無理に張らない）"
